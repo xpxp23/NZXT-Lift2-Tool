@@ -1,0 +1,7 @@
+/target
+lift2.exe
+logs/
+*.log
+*.tmp
+*.bak
+*.png

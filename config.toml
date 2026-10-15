@@ -1,0 +1,18 @@
+[mouse]
+active_stage = 4
+stages = [
+    1200,
+    1600,
+    2400,
+    3200,
+    5000,
+]
+polling_rate = 8000
+lod = 1
+
+[system]
+high_res_timer = true
+release_stuck_click_on_start = true
+show_osd = true
+reset_hotkey = "Ctrl+Shift+F12"
+theme = "obsidian"

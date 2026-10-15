@@ -1,0 +1,174 @@
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MouseConfig {
+    #[serde(default = "default_active_stage")]
+    pub active_stage: u8, // 1..5
+
+    #[serde(default = "default_stages")]
+    pub stages: [u32; 5],
+
+    #[serde(default = "default_polling_rate")]
+    pub polling_rate: u32, // 125, 250, 500, 1000, 2000, 4000, 8000
+
+    #[serde(default = "default_lod")]
+    pub lod: u32, // 1 (1mm) or 2 (2mm)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemConfig {
+    #[serde(default = "default_true")]
+    pub high_res_timer: bool,
+
+    #[serde(default = "default_true")]
+    pub release_stuck_click_on_start: bool,
+
+    #[serde(default = "default_true")]
+    pub show_osd: bool,
+
+    #[serde(default = "default_hotkey")]
+    pub reset_hotkey: String, // Global keyboard shortcut to cycle USB port
+
+    #[serde(default = "default_theme")]
+    pub theme: String, // "obsidian" or "fluent"
+}
+
+fn default_active_stage() -> u8 {
+    3
+}
+
+fn default_stages() -> [u32; 5] {
+    [400, 800, 1600, 3200, 6400]
+}
+
+fn default_polling_rate() -> u32 {
+    1000
+}
+
+fn default_lod() -> u32 {
+    1
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_hotkey() -> String {
+    "Ctrl+Shift+F12".to_string()
+}
+
+fn default_theme() -> String {
+    "obsidian".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    #[serde(default)]
+    pub mouse: MouseConfig,
+
+    #[serde(default)]
+    pub system: SystemConfig,
+}
+
+impl Default for MouseConfig {
+    fn default() -> Self {
+        Self {
+            active_stage: default_active_stage(),
+            stages: default_stages(),
+            polling_rate: default_polling_rate(),
+            lod: default_lod(),
+        }
+    }
+}
+
+impl Default for SystemConfig {
+    fn default() -> Self {
+        Self {
+            high_res_timer: true,
+            release_stuck_click_on_start: true,
+            show_osd: true,
+            reset_hotkey: default_hotkey(),
+            theme: default_theme(),
+        }
+    }
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            mouse: MouseConfig::default(),
+            system: SystemConfig::default(),
+        }
+    }
+}
+
+impl AppConfig {
+    pub fn get_config_path() -> PathBuf {
+        // First check current working directory / exe dir
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(dir) = exe_path.parent() {
+                let local_path = dir.join("config.toml");
+                if local_path.exists() {
+                    return local_path;
+                }
+            }
+        }
+
+        // Otherwise use %APPDATA%\lift2\config.toml
+        if let Ok(app_data) = std::env::var("APPDATA") {
+            let config_dir = Path::new(&app_data).join("lift2");
+            let _ = fs::create_dir_all(&config_dir);
+            return config_dir.join("config.toml");
+        }
+
+        PathBuf::from("config.toml")
+    }
+
+    pub fn load() -> Self {
+        let path = Self::get_config_path();
+        if path.exists() {
+            if let Ok(content) = fs::read_to_string(&path) {
+                if let Ok(cfg) = toml::from_str::<AppConfig>(&content) {
+                    return cfg;
+                }
+            }
+        }
+
+        // Return default and save it
+        let default_cfg = Self::default();
+        let _ = default_cfg.save();
+        default_cfg
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let path = Self::get_config_path();
+        let content = toml::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize config: {}", e))?;
+        fs::write(&path, content)
+            .map_err(|e| format!("Failed to write config file to {:?}: {}", path, e))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_serialization_with_custom_hotkey() {
+        let mut cfg = AppConfig::default();
+        cfg.system.reset_hotkey = "Ctrl+Alt+R".to_string();
+        cfg.system.theme = "fluent".to_string();
+        cfg.mouse.stages[0] = 600;
+
+        let toml_str = toml::to_string(&cfg).expect("Should serialize config");
+        let parsed: AppConfig = toml::from_str(&toml_str).expect("Should deserialize config");
+
+        assert_eq!(parsed.system.reset_hotkey, "Ctrl+Alt+R");
+        assert_eq!(parsed.system.theme, "fluent");
+        assert_eq!(parsed.mouse.stages[0], 600);
+    }
+}
+
