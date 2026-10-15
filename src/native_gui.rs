@@ -22,10 +22,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, GetClientRect,
     GetMessageW, GetSystemMetrics, GetWindowLongPtrW, KillTimer, LoadCursorW, PostMessageW,
     PostQuitMessage, RegisterClassExW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    ShowWindow, TranslateMessage, GWLP_USERDATA, IDC_ARROW, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
-    WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_SYSKEYDOWN, WM_TIMER, WM_USER, WNDCLASSEXW,
-    WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
+    ShowWindow, TranslateMessage, CS_DBLCLKS, GWLP_USERDATA, IDC_ARROW, SM_CXSCREEN, SM_CYSCREEN,
+    SW_SHOW, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_SYSKEYDOWN, WM_TIMER,
+    WM_USER, WNDCLASSEXW, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
 };
 
 extern "system" {
@@ -198,6 +198,8 @@ pub struct NativeGuiState {
     pub status_message: Option<(String, Instant)>,
     pub hotkey_buffer: String,
     pub recording_hotkey: bool,
+    pub editing_dpi_stage: Option<usize>,
+    pub editing_dpi_buffer: String,
     active_dropdown: Option<DropdownType>,
     dragging_stage: Option<usize>,
     hover_pos: Option<(i32, i32)>,
@@ -234,6 +236,8 @@ impl NativeGuiState {
             status_message: None,
             hotkey_buffer: initial_hotkey,
             recording_hotkey: false,
+            editing_dpi_stage: None,
+            editing_dpi_buffer: String::new(),
             active_dropdown: None,
             dragging_stage: None,
             hover_pos: None,
@@ -343,6 +347,30 @@ impl NativeGuiState {
     pub fn set_status(&mut self, msg: &str) {
         self.status_message = Some((msg.to_string(), Instant::now()));
     }
+
+    pub fn commit_dpi_edit(&mut self) -> bool {
+        if let Some(stage_idx) = self.editing_dpi_stage.take() {
+            if let Ok(val) = self.editing_dpi_buffer.trim().parse::<u32>() {
+                let clamped = clamp_and_snap_dpi(val);
+                self.settings.stages[stage_idx] = clamped;
+                self.save_settings_to_device();
+                if self.settings.active_cpi_idx == stage_idx as u8 {
+                    show_dpi_osd(clamped, (stage_idx + 1) as u8, 5);
+                }
+                self.set_status(&format!("✅ 档位 {} DPI 已更新为 {}", stage_idx + 1, clamped));
+                return true;
+            } else {
+                self.set_status("ℹ️ DPI 输入无效，已取消修改");
+            }
+        }
+        false
+    }
+
+    pub fn cancel_dpi_edit(&mut self) {
+        if self.editing_dpi_stage.take().is_some() {
+            self.set_status("ℹ️ 已取消 DPI 修改");
+        }
+    }
 }
 
 static GLOBAL_GUI_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -404,7 +432,7 @@ unsafe fn run_native_gui_thread(config: Arc<Mutex<AppConfig>>) {
 
     let wnd_class = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        style: 0,
+        style: CS_DBLCLKS,
         lpfnWndProc: Some(native_gui_wnd_proc),
         cbClsExtra: 0,
         cbWndExtra: 0,
@@ -570,6 +598,52 @@ unsafe extern "system" fn native_gui_wnd_proc(
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
+                if state.editing_dpi_stage.is_some() {
+                    let vk = wparam as u32;
+                    match vk {
+                        0x0D => {
+                            // Enter: commit edit
+                            state.commit_dpi_edit();
+                            InvalidateRect(hwnd, null_mut(), 0);
+                            return 0;
+                        }
+                        0x1B => {
+                            // Esc: cancel edit
+                            state.cancel_dpi_edit();
+                            InvalidateRect(hwnd, null_mut(), 0);
+                            return 0;
+                        }
+                        0x08 => {
+                            // Backspace
+                            state.editing_dpi_buffer.pop();
+                            InvalidateRect(hwnd, null_mut(), 0);
+                            return 0;
+                        }
+                        0x30..=0x39 => {
+                            // Digits 0-9
+                            if state.editing_dpi_buffer.len() < 5 {
+                                let digit = (vk - 0x30) as u8;
+                                state.editing_dpi_buffer.push((b'0' + digit) as char);
+                                InvalidateRect(hwnd, null_mut(), 0);
+                            }
+                            return 0;
+                        }
+                        0x60..=0x69 => {
+                            // Numpad 0-9
+                            if state.editing_dpi_buffer.len() < 5 {
+                                let digit = (vk - 0x60) as u8;
+                                state.editing_dpi_buffer.push((b'0' + digit) as char);
+                                InvalidateRect(hwnd, null_mut(), 0);
+                            }
+                            return 0;
+                        }
+                        _ => {
+                            // Swallow other keys during DPI editing
+                            return 0;
+                        }
+                    }
+                }
+
                 if state.recording_hotkey {
                     let vk = wparam as u32;
                     if vk == 0x1B {
@@ -603,6 +677,33 @@ unsafe extern "system" fn native_gui_wnd_proc(
                 }
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_LBUTTONDBLCLK => {
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                let x = (lparam & 0xFFFF) as i16 as i32;
+                let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+
+                // Commit any ongoing stage DPI editing first
+                state.commit_dpi_edit();
+
+                for i in 0..5 {
+                    let col_x = STAGE_COL_X0 + (i as i32) * STAGE_COL_STEP;
+                    let dpi_rc = UiRect::new(col_x + 6, 150, 128, 32);
+                    if dpi_rc.contains(x, y) {
+                        state.editing_dpi_stage = Some(i);
+                        state.editing_dpi_buffer = state.settings.stages[i].to_string();
+                        state.recording_hotkey = false;
+                        state.set_status(&format!(
+                            "⌨️ 正在修改档位 {} DPI: 请直接输入数字 (按 Enter 保存，Esc 取消)",
+                            i + 1
+                        ));
+                        InvalidateRect(hwnd, null_mut(), 0);
+                        return 0;
+                    }
+                }
+            }
+            0
         }
         WM_LBUTTONDOWN => {
             if !state_ptr.is_null() {
@@ -738,6 +839,9 @@ fn hit_test_interactive_id(state: &NativeGuiState, x: i32, y: i32) -> u32 {
         let col_x = STAGE_COL_X0 + (i as i32) * STAGE_COL_STEP;
         if UiRect::new(col_x + 6, 126, 128, 26).contains(x, y) {
             return 50 + i as u32;
+        }
+        if UiRect::new(col_x + 6, 150, 128, 32).contains(x, y) {
+            return 55 + i as u32;
         }
         if UiRect::new(col_x + 16, 186, 50, 20).contains(x, y) {
             return 60 + i as u32;
@@ -1130,30 +1234,50 @@ unsafe fn render_native_gui(hwnd: HWND, state: &mut NativeGuiState) {
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE,
             );
 
-            // 2. Large DPI Display
-            SelectObject(mem_dc, fonts.large_bold);
-            SetTextColor(
-                mem_dc,
-                if is_active {
-                    rgb(255, 255, 255)
-                } else {
-                    colors.text_primary
-                },
-            );
-            let mut dpi_rc = RECT {
-                left: col_x,
-                top: 156,
-                right: col_x + 140,
-                bottom: 180,
-            };
-            let dpi_str = format!("{} DPI", state.settings.stages[i]);
-            DrawTextW(
-                mem_dc,
-                to_wide(&dpi_str).as_ptr(),
-                -1,
-                &mut dpi_rc,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-            );
+            // 2. Large DPI Display or Inline Interactive Editor
+            if state.editing_dpi_stage == Some(i) {
+                let input_rc = UiRect::new(col_x + 8, 152, 124, 28);
+                draw_rounded_card(mem_dc, &input_rc, colors.card_bg, colors.card_active_border, 4);
+
+                SelectObject(mem_dc, fonts.large_bold);
+                SetTextColor(mem_dc, colors.accent_cyan);
+                let edit_str = format!("{}|", state.editing_dpi_buffer);
+                let mut dpi_rc = input_rc.to_win_rect();
+                DrawTextW(
+                    mem_dc,
+                    to_wide(&edit_str).as_ptr(),
+                    -1,
+                    &mut dpi_rc,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+            } else {
+                let is_dpi_hover = hid == (55 + i as u32);
+                SelectObject(mem_dc, fonts.large_bold);
+                SetTextColor(
+                    mem_dc,
+                    if is_dpi_hover {
+                        colors.accent_cyan
+                    } else if is_active {
+                        rgb(255, 255, 255)
+                    } else {
+                        colors.text_primary
+                    },
+                );
+                let mut dpi_rc = RECT {
+                    left: col_x,
+                    top: 156,
+                    right: col_x + 140,
+                    bottom: 180,
+                };
+                let dpi_str = format!("{} DPI", state.settings.stages[i]);
+                DrawTextW(
+                    mem_dc,
+                    to_wide(&dpi_str).as_ptr(),
+                    -1,
+                    &mut dpi_rc,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+            }
 
             // 3. Step buttons [-50] [+50]
             SelectObject(mem_dc, fonts.small);
@@ -1809,6 +1933,16 @@ unsafe fn render_native_gui(hwnd: HWND, state: &mut NativeGuiState) {
 }
 
 unsafe fn handle_mouse_click(hwnd: HWND, state: &mut NativeGuiState, x: i32, y: i32) {
+    // If currently editing DPI, commit edit if click is outside the editing stage's input box
+    if let Some(stage_idx) = state.editing_dpi_stage {
+        let col_x = STAGE_COL_X0 + (stage_idx as i32) * STAGE_COL_STEP;
+        let dpi_rc = UiRect::new(col_x + 6, 150, 128, 32);
+        if !dpi_rc.contains(x, y) {
+            state.commit_dpi_edit();
+            InvalidateRect(hwnd, null_mut(), 0);
+        }
+    }
+
     // Cancel hotkey recording if user clicks anywhere outside the hotkey badge
     let hk_badge_rc = UiRect::new(120, 380, 125, 24);
     if state.recording_hotkey && !hk_badge_rc.contains(x, y) {
@@ -2228,7 +2362,7 @@ unsafe fn draw_theme_capsule(
     );
 }
 
-fn to_wide(s: &str) -> Vec<u16> {
+pub(crate) fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
 }
 
@@ -2313,4 +2447,37 @@ mod tests {
             fonts.destroy();
         }
     }
+
+    #[test]
+    fn test_dpi_direct_editing_logic() {
+        let config = Arc::new(Mutex::new(AppConfig::default()));
+        let mut state = NativeGuiState::new(config);
+
+        // Initially no stage is being edited
+        assert_eq!(state.editing_dpi_stage, None);
+
+        // Start editing stage 2
+        state.editing_dpi_stage = Some(1);
+        state.editing_dpi_buffer = "1440".to_string();
+
+        // Commit valid edit -> snapped to 1450 (multiples of 50)
+        assert!(state.commit_dpi_edit());
+        assert_eq!(state.editing_dpi_stage, None);
+        assert_eq!(state.settings.stages[1], 1450);
+
+        // Cancel edit
+        state.editing_dpi_stage = Some(0);
+        state.editing_dpi_buffer = "9999".to_string();
+        state.cancel_dpi_edit();
+        assert_eq!(state.editing_dpi_stage, None);
+        // Stage 0 not modified to 9999
+        assert_ne!(state.settings.stages[0], 9999);
+
+        // Invalid input commit -> rejected gracefully
+        state.editing_dpi_stage = Some(2);
+        state.editing_dpi_buffer = "".to_string();
+        assert!(!state.commit_dpi_edit());
+        assert_eq!(state.editing_dpi_stage, None);
+    }
 }
+

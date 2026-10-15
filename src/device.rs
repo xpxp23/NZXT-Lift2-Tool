@@ -213,13 +213,38 @@ impl Lift2Device {
             if pkt[0] != REPORT_ID || pkt[1] == 0xE5 {
                 continue;
             }
-            // Accept packet if opcode matches, or if CMD_GET_ACTIVE_CPI returns stage directly
-            if pkt[3] == opcode || (opcode == CMD_GET_ACTIVE_CPI && pkt[3] <= 4) {
-                return Ok(pkt);
-            }
+            return Ok(pkt);
         }
 
         Err("Received only ACK or mismatched frames, no valid data frame".to_string())
+    }
+
+    pub fn send_set_command(
+        &mut self,
+        opcode: u8,
+        payload: &[u8],
+        timeout_ms: u32,
+    ) -> Result<(), String> {
+        let packet = build_packet(opcode, payload);
+        self.write_packet(&packet, timeout_ms)?;
+
+        for _ in 0..6 {
+            let pkt = self.read_packet(timeout_ms)?;
+            if pkt[0] == REPORT_ID {
+                if pkt[1] == 0xE5 {
+                    if pkt[3] == opcode || pkt[3] == 0x00 {
+                        // Drain optional trailing notification frame with short timeout
+                        let _ = self.read_packet(50);
+                        return Ok(());
+                    }
+                } else {
+                    // Data frame returned in response to SET command
+                    return Ok(());
+                }
+            }
+        }
+
+        Err("Device did not acknowledge write command".to_string())
     }
 
     pub fn get_firmware_version(&mut self) -> Result<String, String> {
@@ -250,8 +275,7 @@ impl Lift2Device {
         if idx > 4 {
             return Err("Stage index must be between 0 and 4".to_string());
         }
-        let _ = self.send_command(CMD_SET_ACTIVE_CPI, &[idx], 400)?;
-        Ok(())
+        self.send_set_command(CMD_SET_ACTIVE_CPI, &[idx], 400)
     }
 
     pub fn get_profile_settings(&mut self, slot: u8) -> Result<Lift2Settings, String> {
@@ -261,8 +285,7 @@ impl Lift2Device {
 
     pub fn set_profile_settings(&mut self, settings: &Lift2Settings) -> Result<(), String> {
         let payload = encode_profile_settings(settings);
-        let _ = self.send_command(CMD_SET_PROFILE_SETTINGS, &payload, 400)?;
-        Ok(())
+        self.send_set_command(CMD_SET_PROFILE_SETTINGS, &payload, 400)
     }
 
     pub fn set_polling_rate(&mut self, slot: u8, rate: PollingRate) -> Result<(), String> {

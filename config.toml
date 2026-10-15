@@ -1,13 +1,13 @@
 [mouse]
-active_stage = 4
+active_stage = 2
 stages = [
+    800,
     1200,
     1600,
-    2400,
     3200,
-    5000,
+    6400,
 ]
-polling_rate = 8000
+polling_rate = 1000
 lod = 1
 
 [system]
