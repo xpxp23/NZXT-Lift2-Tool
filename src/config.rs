@@ -1,8 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+use crate::dpi::clamp_and_snap_dpi;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MouseConfig {
     #[serde(default = "default_active_stage")]
     pub active_stage: u8, // 1..5
@@ -17,7 +20,7 @@ pub struct MouseConfig {
     pub lod: u32, // 1 (1mm) or 2 (2mm)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SystemConfig {
     #[serde(default = "default_true")]
     pub high_res_timer: bool,
@@ -63,7 +66,7 @@ fn default_theme() -> String {
     "obsidian".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
     #[serde(default)]
     pub mouse: MouseConfig,
@@ -105,6 +108,20 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    pub fn sanitize(&mut self) {
+        self.mouse.active_stage = self.mouse.active_stage.clamp(1, 5);
+        for dpi in &mut self.mouse.stages {
+            *dpi = clamp_and_snap_dpi(*dpi);
+        }
+        if ![125, 250, 500, 1000, 2000, 4000, 8000].contains(&self.mouse.polling_rate) {
+            self.mouse.polling_rate = 1000;
+        }
+        self.mouse.lod = if self.mouse.lod >= 2 { 2 } else { 1 };
+        if self.system.reset_hotkey.trim().is_empty() {
+            self.system.reset_hotkey = default_hotkey();
+        }
+    }
+
     pub fn get_config_path() -> PathBuf {
         // First check current working directory / exe dir
         if let Ok(exe_path) = std::env::current_exe() {
@@ -116,6 +133,12 @@ impl AppConfig {
             }
         }
 
+        // Also check current working directory if running from cargo/portable folder
+        let cwd_path = PathBuf::from("config.toml");
+        if cwd_path.exists() {
+            return cwd_path;
+        }
+
         // Otherwise use %APPDATA%\lift2\config.toml
         if let Ok(app_data) = std::env::var("APPDATA") {
             let config_dir = Path::new(&app_data).join("lift2");
@@ -123,14 +146,20 @@ impl AppConfig {
             return config_dir.join("config.toml");
         }
 
-        PathBuf::from("config.toml")
+        cwd_path
+    }
+
+    pub fn get_last_modified() -> Option<SystemTime> {
+        let path = Self::get_config_path();
+        fs::metadata(path).ok().and_then(|m| m.modified().ok())
     }
 
     pub fn load() -> Self {
         let path = Self::get_config_path();
         if path.exists() {
             if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(cfg) = toml::from_str::<AppConfig>(&content) {
+                if let Ok(mut cfg) = toml::from_str::<AppConfig>(&content) {
+                    cfg.sanitize();
                     return cfg;
                 }
             }
@@ -143,8 +172,15 @@ impl AppConfig {
     }
 
     pub fn save(&self) -> Result<(), String> {
+        let mut clean = self.clone();
+        clean.sanitize();
         let path = Self::get_config_path();
-        let content = toml::to_string_pretty(self)
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        let content = toml::to_string_pretty(&clean)
             .map_err(|e| format!("Failed to serialize config: {}", e))?;
         fs::write(&path, content)
             .map_err(|e| format!("Failed to write config file to {:?}: {}", path, e))?;
@@ -170,5 +206,21 @@ mod tests {
         assert_eq!(parsed.system.theme, "fluent");
         assert_eq!(parsed.mouse.stages[0], 600);
     }
-}
 
+    #[test]
+    fn test_config_sanitize_bounds() {
+        let mut cfg = AppConfig::default();
+        cfg.mouse.active_stage = 99;
+        cfg.mouse.stages[0] = 10;
+        cfg.mouse.stages[1] = 825;
+        cfg.mouse.polling_rate = 9999;
+        cfg.mouse.lod = 5;
+        cfg.sanitize();
+
+        assert_eq!(cfg.mouse.active_stage, 5);
+        assert_eq!(cfg.mouse.stages[0], 50);
+        assert_eq!(cfg.mouse.stages[1], 850);
+        assert_eq!(cfg.mouse.polling_rate, 1000);
+        assert_eq!(cfg.mouse.lod, 2);
+    }
+}

@@ -1,25 +1,86 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use windows_sys::Win32::Foundation::{GetLastError, HANDLE, HWND};
 use windows_sys::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_SZ,
+    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+    HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_SZ,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     mouse_event, GetAsyncKeyState, MOUSEEVENTF_LEFTUP, VK_LBUTTON,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+const ERROR_ALREADY_EXISTS: u32 = 183;
+
+extern "system" {
+    fn CreateMutexW(
+        lpMutexAttributes: *mut std::ffi::c_void,
+        bInitialOwner: i32,
+        lpName: *const u16,
+    ) -> HANDLE;
+
+    fn FindWindowW(lpClassName: *const u16, lpWindowName: *const u16) -> HWND;
+}
+
+static HIGH_RES_TIMER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub fn enable_high_res_timer() {
-    unsafe {
-        timeBeginPeriod(1);
+    if !HIGH_RES_TIMER_ACTIVE.swap(true, Ordering::SeqCst) {
+        unsafe {
+            timeBeginPeriod(1);
+        }
     }
 }
 
 pub fn disable_high_res_timer() {
+    if HIGH_RES_TIMER_ACTIVE.swap(false, Ordering::SeqCst) {
+        unsafe {
+            timeEndPeriod(1);
+        }
+    }
+}
+
+/// Ensures only one background/GUI instance of NZXT Lift 2 Driver runs at a time.
+/// If an instance is already running and `wake_gui` is true, sends `WM_WAKE_GUI`
+/// to the existing tray daemon so it brings the control panel to the front, and returns `false`.
+pub fn ensure_single_instance_or_wake(wake_gui: bool) -> bool {
+    let mutex_name = to_wide("Local\\NZXTLift2DriverSingleInstanceMutex");
     unsafe {
-        timeEndPeriod(1);
+        let handle = CreateMutexW(null_mut(), 1, mutex_name.as_ptr());
+        if handle == 0 as HANDLE {
+            return true;
+        }
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            if wake_gui {
+                let class_name = to_wide("NZXTLift2TrayClass");
+                let existing_hwnd = FindWindowW(class_name.as_ptr(), null_mut());
+                if existing_hwnd != 0 as HWND {
+                    PostMessageW(existing_hwnd, crate::tray::WM_WAKE_GUI, 0, 0);
+                }
+            }
+            return false;
+        }
+        // Keep the mutex handle alive for the lifetime of the process
+        true
+    }
+}
+
+/// Notifies an already-running tray/GUI instance to reload configuration and refresh its UI/tooltip.
+/// Returns `true` if a running instance was found and notified.
+pub fn notify_running_instance_refresh() -> bool {
+    let class_name = to_wide("NZXTLift2TrayClass");
+    unsafe {
+        let existing_hwnd = FindWindowW(class_name.as_ptr(), null_mut());
+        if existing_hwnd != 0 as HWND {
+            PostMessageW(existing_hwnd, crate::tray::WM_REFRESH_TRAY, 0, 0);
+            true
+        } else {
+            false
+        }
     }
 }
 

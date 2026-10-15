@@ -1,4 +1,4 @@
-//! Global Hotkey Parser and Validator for Windows Win32 API
+//! Global Hotkey Parser, Formatter, and Validator for Windows Win32 API
 
 pub const MOD_ALT: u32 = 0x0001;
 pub const MOD_CONTROL: u32 = 0x0002;
@@ -19,7 +19,11 @@ pub fn parse_hotkey(s: &str) -> Result<ParsedHotkey, String> {
         return Err("快捷键不能为空 (Hotkey cannot be empty)".to_string());
     }
 
-    let parts: Vec<&str> = trimmed.split('+').map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&str> = trimmed
+        .split('+')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
     if parts.is_empty() {
         return Err("无效快捷键格式 (Invalid hotkey format)".to_string());
     }
@@ -70,7 +74,7 @@ pub fn parse_hotkey(s: &str) -> Result<ParsedHotkey, String> {
     };
 
     let (vk, canonical_key_name) = parse_key(key_str)?;
-    
+
     let mut display_parts = modifier_names;
     display_parts.push(&canonical_key_name);
     let display_name = display_parts.join("+");
@@ -80,6 +84,58 @@ pub fn parse_hotkey(s: &str) -> Result<ParsedHotkey, String> {
         vk_code: vk,
         display_name,
     })
+}
+
+/// Converts a Win32 Virtual-Key code and active modifier states into a canonical hotkey string.
+/// Returns `None` if `vk` is a standalone modifier key or unsupported key.
+pub fn format_hotkey_from_vk(
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    win: bool,
+    vk: u32,
+) -> Option<String> {
+    // Ignore standalone modifier key presses
+    if matches!(vk, 0x10..=0x12 | 0x5B..=0x5C | 0xA0..=0xA5) {
+        return None;
+    }
+
+    let key_name = match vk {
+        0x70..=0x87 => format!("F{}", vk - 0x70 + 1),
+        0x41..=0x5A => ((vk as u8) as char).to_string(),
+        0x30..=0x39 => ((vk as u8) as char).to_string(),
+        0xC0 => "`".to_string(),
+        0x20 => "Space".to_string(),
+        0x09 => "Tab".to_string(),
+        0x0D => "Enter".to_string(),
+        0x08 => "Backspace".to_string(),
+        0x2D => "Insert".to_string(),
+        0x2E => "Delete".to_string(),
+        0x24 => "Home".to_string(),
+        0x23 => "End".to_string(),
+        0x21 => "PageUp".to_string(),
+        0x22 => "PageDown".to_string(),
+        0x13 => "Pause".to_string(),
+        0x2C => "PrintScreen".to_string(),
+        0x91 => "ScrollLock".to_string(),
+        _ => return None,
+    };
+
+    let mut parts = Vec::new();
+    if ctrl {
+        parts.push("Ctrl".to_string());
+    }
+    if shift {
+        parts.push("Shift".to_string());
+    }
+    if alt {
+        parts.push("Alt".to_string());
+    }
+    if win {
+        parts.push("Win".to_string());
+    }
+    parts.push(key_name);
+    Some(parts.join("+"))
 }
 
 fn parse_key(s: &str) -> Result<(u32, String), String> {
@@ -143,7 +199,8 @@ mod tests {
 
     #[test]
     fn test_parse_hotkey_with_spaces_and_lowercase() {
-        let parsed = parse_hotkey("ctrl + alt + r").expect("Should parse with spaces and lowercase");
+        let parsed =
+            parse_hotkey("ctrl + alt + r").expect("Should parse with spaces and lowercase");
         assert_eq!(parsed.modifiers, MOD_CONTROL | MOD_ALT);
         assert_eq!(parsed.vk_code, 'R' as u32);
         assert_eq!(parsed.display_name, "Ctrl+Alt+R");
@@ -161,6 +218,19 @@ mod tests {
         let parsed = parse_hotkey("Win+Shift+F9").expect("Should parse Win key");
         assert_eq!(parsed.modifiers, MOD_WIN | MOD_SHIFT);
         assert_eq!(parsed.vk_code, 0x78); // VK_F9
+    }
+
+    #[test]
+    fn test_format_hotkey_from_vk() {
+        assert_eq!(format_hotkey_from_vk(true, false, false, false, 0x11), None);
+        assert_eq!(
+            format_hotkey_from_vk(true, true, false, false, 0x7B),
+            Some("Ctrl+Shift+F12".to_string())
+        );
+        assert_eq!(
+            format_hotkey_from_vk(true, false, true, false, 'R' as u32),
+            Some("Ctrl+Alt+R".to_string())
+        );
     }
 
     #[test]

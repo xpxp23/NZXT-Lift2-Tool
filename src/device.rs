@@ -12,13 +12,11 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::{CancelIo, DeviceIoControl, GetOverlappedResult, OVERLAPPED};
-use windows_sys::Win32::System::Threading::{
-    ResetEvent, WaitForSingleObject,
-};
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE,
+    RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+    HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE,
 };
+use windows_sys::Win32::System::Threading::{ResetEvent, WaitForSingleObject};
 
 #[link(name = "cfgmgr32")]
 extern "system" {
@@ -62,6 +60,9 @@ use crate::protocol::*;
 
 const IOCTL_USB_CYCLE_PORT: u32 = 0x00220444;
 
+/// Supported NZXT Lift 2 series hardware IDs (PID 2124 = Lift 2 Ergo, PID 2123 = Lift 2 Symm)
+const SUPPORTED_VID_PIDS: [&str; 2] = ["VID_1E71&PID_2124", "VID_1E71&PID_2123"];
+
 #[repr(C)]
 struct UsbCyclePortParams {
     connection_index: u32,
@@ -79,7 +80,7 @@ unsafe impl Send for Lift2Device {}
 impl Lift2Device {
     pub fn open() -> Result<Self, String> {
         let mi01_path = find_lift2_mi01_path()?
-            .ok_or_else(|| "NZXT Lift 2 Ergo (MI_01) not found. Is it plugged in?".to_string())?;
+            .ok_or_else(|| "NZXT Lift 2 (MI_01) not found or disconnected. Is it plugged in?".to_string())?;
 
         let wide: Vec<u16> = OsStr::new(&mi01_path)
             .encode_wide()
@@ -98,11 +99,25 @@ impl Lift2Device {
             );
 
             if handle == INVALID_HANDLE_VALUE {
-                return Err(format!("Failed to open Lift 2 MI_01 handle: Win32 error {}", GetLastError()));
+                return Err(format!(
+                    "Failed to open Lift 2 MI_01 handle: Win32 error {}",
+                    GetLastError()
+                ));
             }
 
             let read_event = CreateEventW(null_mut(), 1, 0, null_mut());
             let write_event = CreateEventW(null_mut(), 1, 0, null_mut());
+
+            if read_event == 0 as HANDLE || write_event == 0 as HANDLE {
+                if read_event != 0 as HANDLE {
+                    CloseHandle(read_event);
+                }
+                if write_event != 0 as HANDLE {
+                    CloseHandle(write_event);
+                }
+                CloseHandle(handle);
+                return Err("Failed to create Win32 Overlapped I/O events".to_string());
+            }
 
             Ok(Self {
                 handle,
@@ -128,17 +143,22 @@ impl Lift2Device {
                 &mut overlapped,
             );
 
-            if ok == 0 && GetLastError() != ERROR_IO_PENDING {
-                return Err(format!("ReadFile failed: error {}", GetLastError()));
+            if ok == 0 {
+                let err = GetLastError();
+                if err != ERROR_IO_PENDING {
+                    return Err(format!("ReadFile failed: error {}", err));
+                }
             }
 
             let wait_res = WaitForSingleObject(self.read_event, timeout_ms);
+            let mut transferred = 0u32;
             if wait_res == WAIT_OBJECT_0 {
-                let mut transferred = 0;
                 GetOverlappedResult(self.handle, &overlapped, &mut transferred, 0);
                 Ok(buf)
             } else {
+                // Safely cancel pending IRP and wait for kernel driver to release stack buffers
                 CancelIo(self.handle);
+                GetOverlappedResult(self.handle, &overlapped, &mut transferred, 1);
                 Err("Read timeout".to_string())
             }
         }
@@ -159,32 +179,47 @@ impl Lift2Device {
                 &mut overlapped,
             );
 
-            if ok == 0 && GetLastError() != ERROR_IO_PENDING {
-                return Err(format!("WriteFile failed: error {}", GetLastError()));
+            if ok == 0 {
+                let err = GetLastError();
+                if err != ERROR_IO_PENDING {
+                    return Err(format!("WriteFile failed: error {}", err));
+                }
             }
 
             let wait_res = WaitForSingleObject(self.write_event, timeout_ms);
+            let mut transferred = 0u32;
             if wait_res == WAIT_OBJECT_0 {
+                GetOverlappedResult(self.handle, &overlapped, &mut transferred, 0);
                 Ok(())
             } else {
                 CancelIo(self.handle);
+                GetOverlappedResult(self.handle, &overlapped, &mut transferred, 1);
                 Err("Write timeout".to_string())
             }
         }
     }
 
-    pub fn send_command(&mut self, opcode: u8, payload: &[u8], timeout_ms: u32) -> Result<[u8; REPORT_SIZE], String> {
+    pub fn send_command(
+        &mut self,
+        opcode: u8,
+        payload: &[u8],
+        timeout_ms: u32,
+    ) -> Result<[u8; REPORT_SIZE], String> {
         let packet = build_packet(opcode, payload);
         self.write_packet(&packet, timeout_ms)?;
 
-        for _ in 0..4 {
+        for _ in 0..6 {
             let pkt = self.read_packet(timeout_ms)?;
-            if pkt[1] != 0xE5 {
+            if pkt[0] != REPORT_ID || pkt[1] == 0xE5 {
+                continue;
+            }
+            // Accept packet if opcode matches, or if CMD_GET_ACTIVE_CPI returns stage directly
+            if pkt[3] == opcode || (opcode == CMD_GET_ACTIVE_CPI && pkt[3] <= 4) {
                 return Ok(pkt);
             }
         }
 
-        Err("Received only ACK frames, no data frame".to_string())
+        Err("Received only ACK or mismatched frames, no valid data frame".to_string())
     }
 
     pub fn get_firmware_version(&mut self) -> Result<String, String> {
@@ -201,8 +236,14 @@ impl Lift2Device {
     }
 
     pub fn get_active_cpi_idx(&mut self) -> Result<u8, String> {
-        let pkt = self.send_command(CMD_GET_ACTIVE_CPI, &[], 400)?;
-        Ok(pkt[3])
+        if let Ok(pkt) = self.send_command(CMD_GET_ACTIVE_CPI, &[], 300) {
+            if let Some(idx) = parse_active_cpi_idx(&pkt) {
+                return Ok(idx);
+            }
+        }
+        // Fallback to reading full profile settings if CMD_GET_ACTIVE_CPI layout varies
+        let settings = self.get_profile_settings(0)?;
+        Ok(settings.active_cpi_idx)
     }
 
     pub fn set_active_cpi_idx(&mut self, idx: u8) -> Result<(), String> {
@@ -263,21 +304,56 @@ impl Drop for Lift2Device {
     }
 }
 
+/// Probes whether a symbolic device path is currently connected and can be opened
+fn is_device_path_active(path: &str, desired_access: u32) -> bool {
+    let wide: Vec<u16> = OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            desired_access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null_mut(),
+            OPEN_EXISTING,
+            0,
+            null_mut(),
+        );
+        if handle != INVALID_HANDLE_VALUE {
+            CloseHandle(handle);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 pub fn find_lift2_mi01_path() -> Result<Option<String>, String> {
     let subkeys = enum_registry_subkeys(
         HKEY_LOCAL_MACHINE,
         "SYSTEM\\CurrentControlSet\\Control\\DeviceClasses\\{4d1e55b2-f16f-11cf-88cb-001111000030}",
     )?;
 
+    let mut fallback_candidate: Option<String> = None;
+
     for key in subkeys {
         let upper = key.to_uppercase();
-        if upper.contains("VID_1E71&PID_2124&MI_01") {
+        if SUPPORTED_VID_PIDS
+            .iter()
+            .any(|vp| upper.contains(&format!("{}&MI_01", vp)))
+        {
             let path = key.replace("##?#", "\\\\?\\");
-            return Ok(Some(path));
+            if is_device_path_active(&path, FILE_GENERIC_READ | FILE_GENERIC_WRITE) {
+                return Ok(Some(path));
+            }
+            if fallback_candidate.is_none() {
+                fallback_candidate = Some(path);
+            }
         }
     }
 
-    Ok(None)
+    Ok(fallback_candidate)
 }
 
 pub fn find_lift2_dpi_button_path() -> Result<Option<String>, String> {
@@ -288,42 +364,68 @@ pub fn find_lift2_dpi_button_path() -> Result<Option<String>, String> {
 
     for key in subkeys {
         let upper = key.to_uppercase();
-        if upper.contains("VID_1E71&PID_2124&MI_00&COL04") {
+        if SUPPORTED_VID_PIDS
+            .iter()
+            .any(|vp| upper.contains(&format!("{}&MI_00&COL04", vp)))
+        {
             let path = key.replace("##?#", "\\\\?\\");
-            return Ok(Some(path));
+            if is_device_path_active(&path, FILE_GENERIC_READ) {
+                return Ok(Some(path));
+            }
         }
     }
 
     Ok(None)
 }
 
-/// Dynamically locates the parent USB Hub and port number for the NZXT Lift 2,
+/// Dynamically locates the currently connected parent USB Hub and port number for the NZXT Lift 2,
 /// and executes IOCTL_USB_CYCLE_PORT to perform a hardware-level bus power cycle.
 pub fn cycle_usb_port() -> Result<(), String> {
-    // 1. Locate mouse USB composite device instance
-    let base_path = "SYSTEM\\CurrentControlSet\\Enum\\USB\\VID_1E71&PID_2124";
-    let instances = enum_registry_subkeys(HKEY_LOCAL_MACHINE, base_path)?;
-    let inst_id = instances.first().ok_or_else(|| "NZXT Lift 2 USB device not found in registry".to_string())?;
+    let mut active_devinst = 0u32;
+    let mut active_port_number = 0u32;
+    let mut found_online_instance = false;
 
-    let device_id_str = format!("USB\\VID_1E71&PID_2124\\{}", inst_id);
-    let wide_device_id: Vec<u16> = OsStr::new(&device_id_str).encode_wide().chain(std::iter::once(0)).collect();
+    for vid_pid in SUPPORTED_VID_PIDS {
+        let base_path = format!("SYSTEM\\CurrentControlSet\\Enum\\USB\\{}", vid_pid);
+        let instances = match enum_registry_subkeys(HKEY_LOCAL_MACHINE, &base_path) {
+            Ok(list) => list,
+            Err(_) => continue,
+        };
 
-    // 2. Query port address from registry
-    let param_key_path = format!("{}\\{}", base_path, inst_id);
-    let port_number = get_registry_dword(&param_key_path, "Address").unwrap_or(4);
+        for inst_id in instances {
+            let device_id_str = format!("USB\\{}\\{}", vid_pid, inst_id);
+            let wide_device_id: Vec<u16> = OsStr::new(&device_id_str)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
 
-    // 3. Resolve parent USB hub using CfgMgr32
-    let mut devinst = 0u32;
+            let mut devinst = 0u32;
+            // ulFlags = 0 (CM_LOCATE_DEVNODE_NORMAL) verifies that the device is currently present in the system
+            let cr = unsafe { CM_Locate_DevNodeW(&mut devinst, wide_device_id.as_ptr(), 0) };
+            if cr == 0 {
+                let param_key_path = format!("{}\\{}", base_path, inst_id);
+                active_port_number = get_registry_dword(&param_key_path, "Address").unwrap_or(1);
+                active_devinst = devinst;
+                found_online_instance = true;
+                break;
+            }
+        }
+
+        if found_online_instance {
+            break;
+        }
+    }
+
+    if !found_online_instance {
+        return Err("未找到当前在线的 NZXT Lift 2 USB 设备节点".to_string());
+    }
+
+    // Resolve parent USB hub using CfgMgr32
     let mut parent_devinst = 0u32;
     let mut parent_id_buf = [0u16; 512];
 
     unsafe {
-        let cr = CM_Locate_DevNodeW(&mut devinst, wide_device_id.as_ptr(), 0);
-        if cr != 0 {
-            return Err(format!("CM_Locate_DevNodeW failed with error {}", cr));
-        }
-
-        let cr_parent = CM_Get_Parent(&mut parent_devinst, devinst, 0);
+        let cr_parent = CM_Get_Parent(&mut parent_devinst, active_devinst, 0);
         if cr_parent != 0 {
             return Err(format!("CM_Get_Parent failed with error {}", cr_parent));
         }
@@ -334,13 +436,22 @@ pub fn cycle_usb_port() -> Result<(), String> {
         }
     }
 
-    let nul_pos = parent_id_buf.iter().position(|&c| c == 0).unwrap_or(parent_id_buf.len());
+    let nul_pos = parent_id_buf
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(parent_id_buf.len());
     let parent_id = String::from_utf16_lossy(&parent_id_buf[..nul_pos]);
 
     // Format parent hub device path: \\?\ + parent_id with \ -> # + #{f18a0e88-c30c-11d0-8815-00a0c906bed8}
-    let hub_path = format!("\\\\?\\{}#{{f18a0e88-c30c-11d0-8815-00a0c906bed8}}", parent_id.replace('\\', "#"));
+    let hub_path = format!(
+        "\\\\?\\{}#{{f18a0e88-c30c-11d0-8815-00a0c906bed8}}",
+        parent_id.replace('\\', "#")
+    );
 
-    let wide_hub: Vec<u16> = OsStr::new(&hub_path).encode_wide().chain(std::iter::once(0)).collect();
+    let wide_hub: Vec<u16> = OsStr::new(&hub_path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
 
     unsafe {
         let handle = CreateFileW(
@@ -354,11 +465,14 @@ pub fn cycle_usb_port() -> Result<(), String> {
         );
 
         if handle == INVALID_HANDLE_VALUE {
-            return Err(format!("Failed to open parent USB hub ({}): Win32 error {}", hub_path, GetLastError()));
+            return Err(format!(
+                "无法打开上级 USB Hub (错误码 {}，建议以管理员权限运行)",
+                GetLastError()
+            ));
         }
 
         let mut params = UsbCyclePortParams {
-            connection_index: port_number,
+            connection_index: active_port_number,
             status_returned: 0,
         };
         let mut bytes_returned = 0u32;
@@ -374,10 +488,14 @@ pub fn cycle_usb_port() -> Result<(), String> {
             null_mut(),
         );
 
+        let err_code = GetLastError();
         CloseHandle(handle);
 
         if ok == 0 {
-            return Err(format!("IOCTL_USB_CYCLE_PORT failed on port {}: error {}", port_number, GetLastError()));
+            return Err(format!(
+                "IOCTL_USB_CYCLE_PORT 端口 {} 复位失败 (Win32错误码 {})",
+                active_port_number, err_code
+            ));
         }
     }
 
@@ -387,30 +505,48 @@ pub fn cycle_usb_port() -> Result<(), String> {
 }
 
 pub fn fix_usb_power_settings() -> Result<(), String> {
-    let base_path = "SYSTEM\\CurrentControlSet\\Enum\\USB\\VID_1E71&PID_2124";
-    let instances = enum_registry_subkeys(HKEY_LOCAL_MACHINE, base_path)?;
+    let mut patched_count = 0usize;
 
-    if instances.is_empty() {
-        return Err("No NZXT Lift 2 USB registry entries found".to_string());
+    for vid_pid in SUPPORTED_VID_PIDS {
+        let base_path = format!("SYSTEM\\CurrentControlSet\\Enum\\USB\\{}", vid_pid);
+        let instances = enum_registry_subkeys(HKEY_LOCAL_MACHINE, &base_path)?;
+
+        for inst in instances {
+            let param_key_path = format!("{}\\{}\\Device Parameters", base_path, inst);
+            set_registry_dword(&param_key_path, "EnhancedPowerManagementEnabled", 0)?;
+            set_registry_dword(&param_key_path, "DeviceSelectiveSuspended", 0)?;
+            set_registry_dword(&param_key_path, "SelectiveSuspendEnabled", 0)?;
+            patched_count += 1;
+        }
     }
 
-    for inst in instances {
-        let param_key_path = format!("{}\\{}\\Device Parameters", base_path, inst);
-        set_registry_dword(&param_key_path, "EnhancedPowerManagementEnabled", 0)?;
-        set_registry_dword(&param_key_path, "DeviceSelectiveSuspended", 0)?;
-        set_registry_dword(&param_key_path, "SelectiveSuspendEnabled", 0)?;
+    if patched_count == 0 {
+        return Err("未找到 NZXT Lift 2 注册表项".to_string());
     }
 
     Ok(())
 }
 
 fn get_registry_dword(sub_key: &str, value_name: &str) -> Option<u32> {
-    let wide_key: Vec<u16> = OsStr::new(sub_key).encode_wide().chain(std::iter::once(0)).collect();
-    let wide_val: Vec<u16> = OsStr::new(value_name).encode_wide().chain(std::iter::once(0)).collect();
+    let wide_key: Vec<u16> = OsStr::new(sub_key)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let wide_val: Vec<u16> = OsStr::new(value_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
 
     unsafe {
         let mut h_key: HKEY = 0 as HKEY;
-        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, wide_key.as_ptr(), 0, KEY_READ, &mut h_key) != 0 {
+        if RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            wide_key.as_ptr(),
+            0,
+            KEY_READ,
+            &mut h_key,
+        ) != 0
+        {
             return None;
         }
 
@@ -436,8 +572,14 @@ fn get_registry_dword(sub_key: &str, value_name: &str) -> Option<u32> {
 }
 
 fn set_registry_dword(sub_key: &str, value_name: &str, value: u32) -> Result<(), String> {
-    let wide_key: Vec<u16> = OsStr::new(sub_key).encode_wide().chain(std::iter::once(0)).collect();
-    let wide_val: Vec<u16> = OsStr::new(value_name).encode_wide().chain(std::iter::once(0)).collect();
+    let wide_key: Vec<u16> = OsStr::new(sub_key)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let wide_val: Vec<u16> = OsStr::new(value_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
 
     unsafe {
         let mut h_key: HKEY = 0 as HKEY;
@@ -455,7 +597,7 @@ fn set_registry_dword(sub_key: &str, value_name: &str, value: u32) -> Result<(),
         );
 
         if res != 0 {
-            return Err(format!("RegCreateKeyExW failed for {}: error {}", sub_key, res));
+            return Err(format!("需要管理员权限 (错误码 {})", res));
         }
 
         let set_res = RegSetValueExW(
@@ -469,14 +611,20 @@ fn set_registry_dword(sub_key: &str, value_name: &str, value: u32) -> Result<(),
         RegCloseKey(h_key);
 
         if set_res != 0 {
-            return Err(format!("RegSetValueExW failed for {}: error {}", value_name, set_res));
+            return Err(format!(
+                "写入注册表 {} 失败 (错误码 {})",
+                value_name, set_res
+            ));
         }
     }
     Ok(())
 }
 
 fn enum_registry_subkeys(root: HKEY, sub_key: &str) -> Result<Vec<String>, String> {
-    let wide_key: Vec<u16> = OsStr::new(sub_key).encode_wide().chain(std::iter::once(0)).collect();
+    let wide_key: Vec<u16> = OsStr::new(sub_key)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let mut h_key: HKEY = 0 as HKEY;
 
     unsafe {

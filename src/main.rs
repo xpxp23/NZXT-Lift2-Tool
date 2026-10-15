@@ -14,12 +14,16 @@ mod tray;
 
 use clap::{Parser, Subcommand};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::config::AppConfig;
 use crate::device::{cycle_usb_port, fix_usb_power_settings, Lift2Device};
-use crate::osd::show_dpi_osd;
+use crate::osd::{set_osd_enabled, show_dpi_osd};
 use crate::protocol::{LiftOffDistance, PollingRate};
-use crate::system::{enable_high_res_timer, release_stuck_clicks};
+use crate::system::{
+    enable_high_res_timer, ensure_single_instance_or_wake, notify_running_instance_refresh,
+    release_stuck_clicks,
+};
 use crate::tray::TrayApp;
 
 extern "system" {
@@ -31,7 +35,7 @@ const ATTACH_PARENT_PROCESS: u32 = 0xFFFFFFFF;
 #[command(name = "lift2")]
 #[command(author = "Antigravity")]
 #[command(version = "1.0.0")]
-#[command(about = "Ultra-lightweight native driver & manager for NZXT Lift 2 Ergo")]
+#[command(about = "Ultra-lightweight native driver & manager for NZXT Lift 2 Ergo / Symm")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -91,6 +95,7 @@ fn main() {
 
     let cli = Cli::parse();
     let mut config = AppConfig::load();
+    set_osd_enabled(config.system.show_osd);
 
     match cli.command {
         Some(Commands::Status) => {
@@ -124,7 +129,7 @@ fn main() {
 }
 
 fn cmd_status() {
-    println!("Connecting to NZXT Lift 2 Ergo...");
+    println!("Connecting to NZXT Lift 2...");
     let mut dev = match Lift2Device::open() {
         Ok(d) => d,
         Err(e) => {
@@ -134,7 +139,9 @@ fn cmd_status() {
         }
     };
 
-    let fw = dev.get_firmware_version().unwrap_or_else(|_| "Unknown".to_string());
+    let fw = dev
+        .get_firmware_version()
+        .unwrap_or_else(|_| "Unknown".to_string());
     let uid = dev.get_uid().unwrap_or_else(|_| "Unknown".to_string());
     let settings = match dev.get_profile_settings(0) {
         Ok(s) => s,
@@ -144,19 +151,28 @@ fn cmd_status() {
         }
     };
 
-    println!("\n================ NZXT Lift 2 Ergo Status ================");
-    println!(" Firmware Version : v{}", fw);
+    let active_idx = settings.active_cpi_idx.min(4);
+    println!("\n================ NZXT Lift 2 Status ================");
+    println!(" Firmware Version : v{}", fw.trim_start_matches('v'));
     println!(" Hardware Serial  : {}", uid);
-    println!(" Polling Rate     : {} Hz ({})", settings.polling_rate.to_hz(), settings.polling_rate.to_delay_str());
+    println!(
+        " Polling Rate     : {} Hz ({})",
+        settings.polling_rate.to_hz(),
+        settings.polling_rate.to_delay_str()
+    );
     println!(" Lift-off Height  : {}", settings.lod.to_label());
-    println!(" Active Stage     : Stage {} ({} DPI)", settings.active_cpi_idx + 1, settings.stages[settings.active_cpi_idx as usize]);
-    println!("---------------------------------------------------------");
+    println!(
+        " Active Stage     : Stage {} ({} DPI)",
+        active_idx + 1,
+        settings.stages[active_idx as usize]
+    );
+    println!("----------------------------------------------------");
     println!(" Configured DPI Stages (Onboard Flash):");
     for (i, &dpi) in settings.stages.iter().enumerate() {
-        let marker = if i as u8 == settings.active_cpi_idx { "-->" } else { "   " };
+        let marker = if i as u8 == active_idx { "-->" } else { "   " };
         println!("  {} Stage {}: {:5} DPI", marker, i + 1, dpi);
     }
-    println!("=========================================================\n");
+    println!("====================================================\n");
 }
 
 fn cmd_switch(stage: u8, config: &mut AppConfig) {
@@ -174,15 +190,31 @@ fn cmd_switch(stage: u8, config: &mut AppConfig) {
         std::process::exit(1);
     }
 
+    if let Ok(mut settings) = dev.get_profile_settings(0) {
+        settings.active_cpi_idx = idx;
+        let _ = dev.set_profile_settings(&settings);
+        config.mouse.stages = settings.stages;
+        config.mouse.polling_rate = settings.polling_rate.to_hz();
+        config.mouse.lod = settings.lod.to_mm();
+    }
+
     config.mouse.active_stage = stage;
     let _ = config.save();
 
     let dpi = config.mouse.stages[idx as usize];
     println!("Switched to Stage {} ({} DPI)", stage, dpi);
-    show_dpi_osd(dpi, stage, 5);
+
+    let daemon_notified = notify_running_instance_refresh();
+    if config.system.show_osd {
+        show_dpi_osd(dpi, stage, 5);
+        if !daemon_notified {
+            std::thread::sleep(Duration::from_millis(1250));
+        }
+    }
 }
 
 fn cmd_set_dpi(stage: u8, dpi: u32, config: &mut AppConfig) {
+    let snapped_dpi = crate::dpi::clamp_and_snap_dpi(dpi);
     let mut dev = match Lift2Device::open() {
         Ok(d) => d,
         Err(e) => {
@@ -200,24 +232,35 @@ fn cmd_set_dpi(stage: u8, dpi: u32, config: &mut AppConfig) {
         }
     };
 
-    settings.stages[idx] = dpi;
+    settings.stages[idx] = snapped_dpi;
     if let Err(e) = dev.set_profile_settings(&settings) {
         eprintln!("Failed to save DPI: {}", e);
         std::process::exit(1);
     }
 
-    config.mouse.stages[idx] = dpi;
+    config.mouse.stages = settings.stages;
+    config.mouse.active_stage = settings.active_cpi_idx.min(4) + 1;
     let _ = config.save();
 
-    println!("Stage {} set to {} DPI (Saved to mouse flash memory)", stage, dpi);
-    if config.mouse.active_stage == stage {
-        show_dpi_osd(dpi, stage, 5);
+    println!(
+        "Stage {} set to {} DPI (Saved to mouse flash memory)",
+        stage, snapped_dpi
+    );
+    let daemon_notified = notify_running_instance_refresh();
+    if config.mouse.active_stage == stage && config.system.show_osd {
+        show_dpi_osd(snapped_dpi, stage, 5);
+        if !daemon_notified {
+            std::thread::sleep(Duration::from_millis(1250));
+        }
     }
 }
 
 fn cmd_set_polling(rate_hz: u32, config: &mut AppConfig) {
     if ![125, 250, 500, 1000, 2000, 4000, 8000].contains(&rate_hz) {
-        eprintln!("Invalid polling rate: {} Hz. Allowed rates: 125, 250, 500, 1000, 2000, 4000, 8000 Hz.", rate_hz);
+        eprintln!(
+            "Invalid polling rate: {} Hz. Allowed rates: 125, 250, 500, 1000, 2000, 4000, 8000 Hz.",
+            rate_hz
+        );
         std::process::exit(1);
     }
 
@@ -237,7 +280,12 @@ fn cmd_set_polling(rate_hz: u32, config: &mut AppConfig) {
 
     config.mouse.polling_rate = rate_hz;
     let _ = config.save();
-    println!("Polling rate updated to {} Hz ({}) (Saved to onboard flash)", rate_hz, rate.to_delay_str());
+    let _ = notify_running_instance_refresh();
+    println!(
+        "Polling rate updated to {} Hz ({}) (Saved to onboard flash)",
+        rate_hz,
+        rate.to_delay_str()
+    );
 }
 
 fn cmd_set_lod(lod_mm: u32, config: &mut AppConfig) {
@@ -257,7 +305,11 @@ fn cmd_set_lod(lod_mm: u32, config: &mut AppConfig) {
 
     config.mouse.lod = lod_mm;
     let _ = config.save();
-    println!("Sensor LOD updated to {} (Saved to onboard flash)", lod.to_label());
+    let _ = notify_running_instance_refresh();
+    println!(
+        "Sensor LOD updated to {} (Saved to onboard flash)",
+        lod.to_label()
+    );
 }
 
 fn cmd_reset_usb() {
@@ -267,9 +319,11 @@ fn cmd_reset_usb() {
             println!("Port cycle signal successfully sent to parent USB Hub.");
             println!("Resetting OS mouse button latch states...");
             release_stuck_clicks();
+            let _ = notify_running_instance_refresh();
             println!("Success! Mouse optical switches and MCU cleanly rebooted.");
         }
         Err(e) => {
+            release_stuck_clicks();
             eprintln!("Error resetting USB port: {}", e);
             std::process::exit(1);
         }
@@ -295,6 +349,10 @@ fn cmd_fix_power() {
 }
 
 fn cmd_tray(config: AppConfig) {
+    if !ensure_single_instance_or_wake(false) {
+        return;
+    }
+
     if config.system.release_stuck_click_on_start {
         release_stuck_clicks();
     }
@@ -304,15 +362,15 @@ fn cmd_tray(config: AppConfig) {
 
     let shared_cfg = Arc::new(Mutex::new(config));
     let tray_app = TrayApp::new(shared_cfg);
-    tray_app.start_background_threads();
-
-    // Keep thread alive if running in tray-only mode
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
-    }
+    tray_app.run_event_loop_on_current_thread();
 }
 
 fn cmd_gui(config: AppConfig) {
+    // If an instance is already running in the system tray, wake its GUI window and exit
+    if !ensure_single_instance_or_wake(true) {
+        return;
+    }
+
     if config.system.release_stuck_click_on_start {
         release_stuck_clicks();
     }
@@ -322,15 +380,10 @@ fn cmd_gui(config: AppConfig) {
 
     let shared_cfg = Arc::new(Mutex::new(config));
 
-    // Start background tray daemon, DPI button listener, and Global Hotkey
-    let tray_app = TrayApp::new(Arc::clone(&shared_cfg));
-    tray_app.start_background_threads();
-
-    // Open zero-overhead Win32 Native Double-Buffered GUI (< 8MB RAM, 0ms latency)
+    // Open zero-overhead Win32 Native Double-Buffered GUI
     crate::native_gui::open_native_gui(Arc::clone(&shared_cfg));
 
-    // Keep process alive so background tray daemon, DPI listener, and hotkeys stay responsive
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
-    }
+    // Run background tray daemon, DPI button listener, and Global Hotkey on current main thread
+    let tray_app = TrayApp::new(shared_cfg);
+    tray_app.run_event_loop_on_current_thread();
 }

@@ -1,6 +1,5 @@
 //! Aesthetic, high-resolution gaming mouse icon generator for NZXT Lift 2 Ergo
 
-
 /// Generates an RGBA8 bitmap of an elegant, sleek esports gaming mouse
 /// with ergonomic contours, neon purple accents, and glowing cyan scroll wheel.
 pub fn generate_mouse_icon_rgba(size: u32) -> Vec<u8> {
@@ -15,7 +14,11 @@ pub fn generate_mouse_icon_rgba(size: u32) -> Vec<u8> {
 
             // Ergonomic asymmetrical mouse body contour equation
             // Lift 2 Ergo has a wider thumb groove on left (negative nx)
-            let ergo_shift = if nx < 0.0 { -0.08 * (1.0 - ny.abs()) } else { 0.04 * (1.0 - ny.abs()) };
+            let ergo_shift = if nx < 0.0 {
+                -0.08 * (1.0 - ny.abs())
+            } else {
+                0.04 * (1.0 - ny.abs())
+            };
             let adj_nx = nx - ergo_shift;
 
             // Base egg/oval shape with wider palm base and tapered clicks
@@ -95,54 +98,93 @@ pub fn generate_mouse_icon_rgba(size: u32) -> Vec<u8> {
     rgba
 }
 
-/// Generates a Win32 HICON for the tray or window with proper 1-bit transparency mask
 #[cfg(windows)]
-pub unsafe fn create_custom_hicon(size: u32) -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
-    use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::Graphics::Gdi::{
-        CreateBitmap, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
-        GetDC, ReleaseDC, SelectObject, SetPixel,
-    };
+#[repr(C)]
+struct BitmapInfoHeader {
+    bi_size: u32,
+    bi_width: i32,
+    bi_height: i32,
+    bi_planes: u16,
+    bi_bit_count: u16,
+    bi_compression: u32,
+    bi_size_image: u32,
+    bi_x_pels_per_meter: i32,
+    bi_y_pels_per_meter: i32,
+    bi_clr_used: u32,
+    bi_clr_important: u32,
+}
+
+#[cfg(windows)]
+extern "system" {
+    fn CreateDIBSection(
+        hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+        pbmi: *const BitmapInfoHeader,
+        usage: u32,
+        ppvbits: *mut *mut u8,
+        hsection: windows_sys::Win32::Foundation::HANDLE,
+        offset: u32,
+    ) -> windows_sys::Win32::Graphics::Gdi::HBITMAP;
+}
+
+/// Generates a 32-bit premultiplied BGRA Win32 HICON with full per-pixel alpha anti-aliasing
+#[cfg(windows)]
+pub unsafe fn create_custom_hicon(
+    size: u32,
+) -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
+    use windows_sys::Win32::Foundation::{HANDLE, HWND};
+    use windows_sys::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject, GetDC, ReleaseDC};
     use windows_sys::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, ICONINFO};
 
     let rgba = generate_mouse_icon_rgba(size);
 
+    let bmi = BitmapInfoHeader {
+        bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+        bi_width: size as i32,
+        bi_height: -(size as i32), // top-down DIB
+        bi_planes: 1,
+        bi_bit_count: 32,
+        bi_compression: 0, // BI_RGB
+        bi_size_image: size * size * 4,
+        bi_x_pels_per_meter: 0,
+        bi_y_pels_per_meter: 0,
+        bi_clr_used: 0,
+        bi_clr_important: 0,
+    };
+
     let dc = GetDC(0 as HWND);
-    let mem_dc = CreateCompatibleDC(dc);
-    let color_bmp = CreateCompatibleBitmap(dc, size as i32, size as i32);
+    let mut dib_bits: *mut u8 = std::ptr::null_mut();
+    let color_bmp = CreateDIBSection(dc, &bmi, 0, &mut dib_bits, 0 as HANDLE, 0);
+    ReleaseDC(0 as HWND, dc);
 
-    let old_bmp = SelectObject(mem_dc, color_bmp);
-
-    // Scan line width for 1-bit monochrome bitmap must be WORD (16-bit) aligned
+    // Scan line width for 1-bit monochrome fallback mask must be WORD (16-bit) aligned
     let bytes_per_line = ((size + 15) / 16 * 2) as usize;
     let mut mask_bits = vec![0u8; bytes_per_line * (size as usize)];
 
-    for y in 0..size {
-        for x in 0..size {
-            let idx = ((y * size + x) * 4) as usize;
-            let r = rgba[idx] as u32;
-            let g = rgba[idx + 1] as u32;
-            let b = rgba[idx + 2] as u32;
-            let a = rgba[idx + 3];
+    if !dib_bits.is_null() {
+        let dst = std::slice::from_raw_parts_mut(dib_bits, (size * size * 4) as usize);
+        for y in 0..size {
+            for x in 0..size {
+                let idx = ((y * size + x) * 4) as usize;
+                let r = rgba[idx] as u32;
+                let g = rgba[idx + 1] as u32;
+                let b = rgba[idx + 2] as u32;
+                let a = rgba[idx + 3] as u32;
 
-            if a < 30 {
-                // Transparent pixel: bit = 1 in mask
-                let line_offset = (y as usize) * bytes_per_line;
-                let byte_idx = line_offset + (x as usize) / 8;
-                let bit_shift = 7 - (x % 8);
-                mask_bits[byte_idx] |= 1 << bit_shift;
-                SetPixel(mem_dc, x as i32, y as i32, 0);
-            } else {
-                // Opaque pixel: bit = 0 in mask, color in RGB
-                let color = (r) | (g << 8) | (b << 16);
-                SetPixel(mem_dc, x as i32, y as i32, color);
+                // Premultiply RGB by alpha for smooth Win32 32-bpp ARGB icon blending
+                dst[idx] = ((b * a + 127) / 255) as u8;
+                dst[idx + 1] = ((g * a + 127) / 255) as u8;
+                dst[idx + 2] = ((r * a + 127) / 255) as u8;
+                dst[idx + 3] = a as u8;
+
+                if a == 0 {
+                    let line_offset = (y as usize) * bytes_per_line;
+                    let byte_idx = line_offset + (x as usize) / 8;
+                    let bit_shift = 7 - (x % 8);
+                    mask_bits[byte_idx] |= 1 << bit_shift;
+                }
             }
         }
     }
-
-    SelectObject(mem_dc, old_bmp);
-    DeleteDC(mem_dc);
-    ReleaseDC(0 as HWND, dc);
 
     let mask_bmp = CreateBitmap(
         size as i32,

@@ -1,3 +1,5 @@
+use crate::config::MouseConfig;
+
 pub const REPORT_ID: u8 = 0x43;
 pub const REPORT_SIZE: usize = 64;
 
@@ -55,6 +57,7 @@ impl PollingRate {
             8000 => Self::Hz8000,
             4000 => Self::Hz4000,
             2000 => Self::Hz2000,
+            1000 => Self::Hz1000,
             500 => Self::Hz500,
             250 => Self::Hz250,
             125 => Self::Hz125,
@@ -79,11 +82,12 @@ impl PollingRate {
         }
     }
 
+    /// Ordered strictly from highest to lowest polling rate for consistent UI presentation
     pub const ALL: [PollingRate; 7] = [
-        PollingRate::Hz1000,
         PollingRate::Hz8000,
         PollingRate::Hz4000,
         PollingRate::Hz2000,
+        PollingRate::Hz1000,
         PollingRate::Hz500,
         PollingRate::Hz250,
         PollingRate::Hz125,
@@ -155,6 +159,24 @@ impl Default for Lift2Settings {
     }
 }
 
+impl Lift2Settings {
+    pub fn from_mouse_config(cfg: &MouseConfig) -> Self {
+        let active_idx = cfg.active_stage.clamp(1, 5).saturating_sub(1);
+        let mut stages = cfg.stages;
+        for s in &mut stages {
+            *s = crate::dpi::clamp_and_snap_dpi(*s);
+        }
+        Self {
+            slot: 0,
+            polling_rate: PollingRate::from_hz(cfg.polling_rate),
+            lod: LiftOffDistance::from_mm(cfg.lod),
+            stage_count: 5,
+            active_cpi_idx: active_idx,
+            stages,
+        }
+    }
+}
+
 pub fn dpi_to_raw(dpi: u32) -> u16 {
     // Formula: (dpi - 50) / 50
     let clamped = dpi.clamp(50, 26000);
@@ -163,7 +185,7 @@ pub fn dpi_to_raw(dpi: u32) -> u16 {
 
 pub fn raw_to_dpi(raw: u16) -> u32 {
     // Formula: raw * 50 + 50
-    (raw as u32) * 50 + 50
+    ((raw as u32) * 50 + 50).clamp(50, 26000)
 }
 
 /// Builds a 64-byte output report buffer for NZXT Lift 2
@@ -179,6 +201,25 @@ pub fn build_packet(opcode: u8, payload: &[u8]) -> [u8; REPORT_SIZE] {
         }
     }
     buf
+}
+
+/// Safely extracts the active CPI stage index (0..=4) from a CMD_GET_ACTIVE_CPI response packet
+pub fn parse_active_cpi_idx(packet: &[u8]) -> Option<u8> {
+    if packet.len() < 5 || packet[0] != REPORT_ID {
+        return None;
+    }
+    // Standard payload offset is byte 4 when byte 3 echoes CMD_GET_ACTIVE_CPI (0x9A)
+    if packet[3] == CMD_GET_ACTIVE_CPI && packet[4] <= 4 {
+        return Some(packet[4]);
+    }
+    // Fallback for firmware variants that place the stage index directly at byte 3
+    if packet[3] <= 4 {
+        return Some(packet[3]);
+    }
+    if packet[4] <= 4 {
+        return Some(packet[4]);
+    }
+    None
 }
 
 /// Parses the data packet returned by CMD_GET_PROFILE_SETTINGS (0x92)
@@ -202,11 +243,11 @@ pub fn parse_profile_settings(packet: &[u8]) -> Result<Lift2Settings, String> {
         return Err(format!("Invalid report ID: 0x{:02X}", packet[0]));
     }
 
-    let slot = packet[4];
+    let slot = packet[4].min(4);
     let polling_rate = PollingRate::from_raw(packet[5]);
     let lod = LiftOffDistance::from_raw(packet[6]);
-    let stage_count = packet[7];
-    let active_cpi_idx = packet[8];
+    let stage_count = packet[7].clamp(1, 5);
+    let active_cpi_idx = packet[8].min(4);
 
     let mut stages = [400u32; 5];
     for i in 0..5 {
@@ -230,15 +271,63 @@ pub fn parse_profile_settings(packet: &[u8]) -> Result<Lift2Settings, String> {
 /// Encodes payload for CMD_SET_PROFILE_SETTINGS (0x93)
 pub fn encode_profile_settings(settings: &Lift2Settings) -> Vec<u8> {
     let mut payload = Vec::with_capacity(16);
-    payload.push(settings.slot);
+    payload.push(settings.slot.min(4));
     payload.push(settings.polling_rate.to_raw());
     payload.push(settings.lod.to_raw());
-    payload.push(settings.stage_count);
-    payload.push(settings.active_cpi_idx);
+    payload.push(settings.stage_count.clamp(1, 5));
+    payload.push(settings.active_cpi_idx.min(4));
     for &dpi in &settings.stages {
         let raw = dpi_to_raw(dpi);
         payload.extend_from_slice(&raw.to_be_bytes());
     }
     payload.push(0xFF);
     payload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_polling_rate_all_descending() {
+        let hz_list: Vec<u32> = PollingRate::ALL.iter().map(|r| r.to_hz()).collect();
+        assert_eq!(hz_list, vec![8000, 4000, 2000, 1000, 500, 250, 125]);
+    }
+
+    #[test]
+    fn test_parse_active_cpi_idx_variants() {
+        let mut pkt_std = [0u8; REPORT_SIZE];
+        pkt_std[0] = REPORT_ID;
+        pkt_std[3] = CMD_GET_ACTIVE_CPI;
+        pkt_std[4] = 3;
+        assert_eq!(parse_active_cpi_idx(&pkt_std), Some(3));
+
+        let mut pkt_legacy = [0u8; REPORT_SIZE];
+        pkt_legacy[0] = REPORT_ID;
+        pkt_legacy[3] = 2;
+        pkt_legacy[4] = 0xFF;
+        assert_eq!(parse_active_cpi_idx(&pkt_legacy), Some(2));
+
+        let mut pkt_invalid = [0u8; REPORT_SIZE];
+        pkt_invalid[0] = REPORT_ID;
+        pkt_invalid[3] = CMD_GET_ACTIVE_CPI;
+        pkt_invalid[4] = 0xFF;
+        assert_eq!(parse_active_cpi_idx(&pkt_invalid), None);
+    }
+
+    #[test]
+    fn test_parse_profile_settings_clamping() {
+        let mut pkt = [0u8; REPORT_SIZE];
+        pkt[0] = REPORT_ID;
+        pkt[3] = CMD_GET_PROFILE_SETTINGS;
+        pkt[4] = 9;  // out-of-range slot
+        pkt[5] = 0;  // 8000Hz
+        pkt[6] = 1;  // 2mm
+        pkt[7] = 99; // out-of-range stage count
+        pkt[8] = 42; // out-of-range active_cpi_idx
+        let parsed = parse_profile_settings(&pkt).expect("Should parse and clamp");
+        assert_eq!(parsed.slot, 4);
+        assert_eq!(parsed.stage_count, 5);
+        assert_eq!(parsed.active_cpi_idx, 4);
+    }
 }
